@@ -58,8 +58,14 @@ const globalForDb = globalThis;
 export function db() {
   if (!globalForDb.__releaseBriefDb) {
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+    // Serverless hosts such as Vercel only allow writes under /tmp, and that
+    // folder is wiped when the instance is recycled. Fine for a demo, not for
+    // real use: set DB_PATH (or use a hosted database) to keep data.
     const file =
-      process.env.DB_PATH ?? path.join(process.cwd(), "data", "app.db");
+      process.env.DB_PATH ??
+      (process.env.VERCEL
+        ? "/tmp/release-brief.db"
+        : path.join(process.cwd(), "data", "app.db"));
     if (file !== ":memory:")
       fs.mkdirSync(path.dirname(file), { recursive: true });
     const database = new DatabaseSync(file);
