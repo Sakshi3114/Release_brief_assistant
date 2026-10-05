@@ -1,8 +1,12 @@
-// SQLite through Node's built-in node:sqlite module (Node 22.13+), so there is no
-// native dependency to compile. getBuiltinModule keeps the bundler out of it.
+// Database access through the libSQL client, which speaks SQLite.
+// - Locally it uses a plain SQLite file (data/app.db), so there is nothing to set up.
+// - When TURSO_DATABASE_URL is set it uses a hosted Turso database instead. That is
+//   what the deployed app needs: serverless hosts have no disk that survives restarts.
+// Every call is async because the hosted database is reached over the network.
 
 import fs from "node:fs";
 import path from "node:path";
+import { createClient } from "@libsql/client";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS releases (
@@ -53,24 +57,70 @@ CREATE TABLE IF NOT EXISTS briefs (
 );
 `;
 
+function localFileUrl() {
+  // Without Turso on a serverless host, /tmp is the only writable folder.
+  // Data there is temporary; it is a fallback, not a real deployment setup.
+  const file =
+    process.env.DB_PATH ??
+    (process.env.VERCEL
+      ? "/tmp/release-brief.db"
+      : path.join(process.cwd(), "data", "app.db"));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return `file:${file.replace(/\\/g, "/")}`;
+}
+
 const globalForDb = globalThis;
 
+/** Returns the connected client, creating the tables on first use. */
 export function db() {
   if (!globalForDb.__releaseBriefDb) {
-    const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
-    // Serverless hosts such as Vercel only allow writes under /tmp, and that
-    // folder is wiped when the instance is recycled. Fine for a demo, not for
-    // real use: set DB_PATH (or use a hosted database) to keep data.
-    const file =
-      process.env.DB_PATH ??
-      (process.env.VERCEL
-        ? "/tmp/release-brief.db"
-        : path.join(process.cwd(), "data", "app.db"));
-    if (file !== ":memory:")
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-    const database = new DatabaseSync(file);
-    database.exec(SCHEMA);
-    globalForDb.__releaseBriefDb = database;
+    const client = createClient({
+      // "||" so that an empty value in .env falls back to the local file too.
+      url: process.env.TURSO_DATABASE_URL || localFileUrl(),
+      authToken: process.env.TURSO_AUTH_TOKEN || undefined,
+    });
+    globalForDb.__releaseBriefDb = client
+      .executeMultiple(SCHEMA)
+      .then(() => client)
+      .catch((error) => {
+        // Don't cache a failed connection; the next request tries again.
+        globalForDb.__releaseBriefDb = undefined;
+        throw error;
+      });
   }
   return globalForDb.__releaseBriefDb;
+}
+
+/** Run a query and return all rows. */
+export async function all(sql, args = []) {
+  const client = await db();
+  return (await client.execute({ sql, args })).rows;
+}
+
+/** Run a query and return the first row, or undefined. */
+export async function get(sql, args = []) {
+  return (await all(sql, args))[0];
+}
+
+/** Run an INSERT or UPDATE. */
+export async function run(sql, args = []) {
+  const client = await db();
+  return client.execute({ sql, args });
+}
+
+/**
+ * Run several writes as one transaction: all of them succeed or none do.
+ * `work` receives the transaction and must use it for every query.
+ */
+export async function inTransaction(work) {
+  const client = await db();
+  const tx = await client.transaction("write");
+  try {
+    const result = await work(tx);
+    await tx.commit();
+    return result;
+  } catch (error) {
+    await tx.rollback();
+    throw error;
+  }
 }

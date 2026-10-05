@@ -23,10 +23,10 @@ export function POST(request) {
   return respond(async () => {
     const body = Body.parse(await request.json());
     if (body.sample === 2)
-      return { id: createRelease(SAMPLE_2_NAME, SAMPLE_2_PACKAGE) };
-    if (body.sample) return { id: createRelease(SAMPLE_NAME, SAMPLE_PACKAGE) };
+      return { id: await createRelease(SAMPLE_2_NAME, SAMPLE_2_PACKAGE) };
+    if (body.sample) return { id: await createRelease(SAMPLE_NAME, SAMPLE_PACKAGE) };
     return {
-      id: createRelease(
+      id: await createRelease(
         body.name ?? "Untitled release",
         body.package ?? emptyPackage(),
       ),

@@ -16,6 +16,6 @@ const Body = z.discriminatedUnion("action", [
 export function PATCH(request, ctx) {
   return respond(async () => {
     const id = parseId((await ctx.params).id);
-    updateStatement(id, Body.parse(await request.json()));
+    await updateStatement(id, Body.parse(await request.json()));
   });
 }

@@ -2,7 +2,7 @@
 
 import { aiMode, analysePackage } from "./ai";
 import { briefBlockers, buildBrief } from "./brief";
-import { db } from "./db";
+import { all, get, inTransaction, run } from "./db";
 import { diffPackages } from "./diff";
 import { applyGuardrails } from "./guardrails";
 import { assignIds } from "./ids";
@@ -19,12 +19,11 @@ export class HttpError extends Error {
 
 const now = () => new Date().toISOString();
 
-function loadVersions(releaseId) {
-  const rows = db()
-    .prepare(
-      "SELECT number, package_json, created_at FROM versions WHERE release_id = ? ORDER BY number",
-    )
-    .all(releaseId);
+async function loadVersions(releaseId) {
+  const rows = await all(
+    "SELECT number, package_json, created_at FROM versions WHERE release_id = ? ORDER BY number",
+    [releaseId],
+  );
   return rows.map((r) => ({
     number: r.number,
     package: JSON.parse(r.package_json),
@@ -32,22 +31,20 @@ function loadVersions(releaseId) {
   }));
 }
 
-function requireRelease(releaseId) {
-  const release = db()
-    .prepare("SELECT id, name FROM releases WHERE id = ?")
-    .get(releaseId);
+async function requireRelease(releaseId) {
+  const release = await get("SELECT id, name FROM releases WHERE id = ?", [
+    releaseId,
+  ]);
   if (!release) throw new HttpError(404, "Release not found.");
   return { id: release.id, name: release.name };
 }
 
-export function listReleases() {
-  const rows = db()
-    .prepare(
-      `SELECT r.id, r.name, r.created_at, MAX(v.number) AS latest
+export async function listReleases() {
+  const rows = await all(
+    `SELECT r.id, r.name, r.created_at, MAX(v.number) AS latest
        FROM releases r LEFT JOIN versions v ON v.release_id = r.id
        GROUP BY r.id ORDER BY r.id DESC`,
-    )
-    .all();
+  );
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
@@ -56,32 +53,26 @@ export function listReleases() {
   }));
 }
 
-export function createRelease(name, input) {
+export async function createRelease(name, input) {
   const pkg = assignIds(input, []);
-  const database = db();
-  database.exec("BEGIN");
-  try {
-    const { lastInsertRowid } = database
-      .prepare("INSERT INTO releases (name, created_at) VALUES (?, ?)")
-      .run(name, now());
+  return inTransaction(async (tx) => {
+    const { lastInsertRowid } = await tx.execute({
+      sql: "INSERT INTO releases (name, created_at) VALUES (?, ?)",
+      args: [name, now()],
+    });
     const releaseId = Number(lastInsertRowid);
-    database
-      .prepare(
-        "INSERT INTO versions (release_id, number, package_json, created_at) VALUES (?, 1, ?, ?)",
-      )
-      .run(releaseId, JSON.stringify(pkg), now());
-    database.exec("COMMIT");
+    await tx.execute({
+      sql: "INSERT INTO versions (release_id, number, package_json, created_at) VALUES (?, 1, ?, ?)",
+      args: [releaseId, JSON.stringify(pkg), now()],
+    });
     return releaseId;
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+  });
 }
 
 /** Saving never overwrites: it adds the next version number. */
-export function saveVersion(releaseId, input) {
-  requireRelease(releaseId);
-  const versions = loadVersions(releaseId);
+export async function saveVersion(releaseId, input) {
+  await requireRelease(releaseId);
+  const versions = await loadVersions(releaseId);
   const latest = versions[versions.length - 1];
   const pkg = assignIds(
     input,
@@ -91,11 +82,10 @@ export function saveVersion(releaseId, input) {
     throw new HttpError(409, "Nothing has changed since the latest version.");
   }
   const number = latest.number + 1;
-  db()
-    .prepare(
-      "INSERT INTO versions (release_id, number, package_json, created_at) VALUES (?, ?, ?, ?)",
-    )
-    .run(releaseId, number, JSON.stringify(pkg), now());
+  await run(
+    "INSERT INTO versions (release_id, number, package_json, created_at) VALUES (?, ?, ?, ?)",
+    [releaseId, number, JSON.stringify(pkg), now()],
+  );
   return number;
 }
 
@@ -113,17 +103,16 @@ function toStatementView(row, latest) {
   };
 }
 
-export function getReleaseView(releaseId) {
-  const release = requireRelease(releaseId);
-  const versions = loadVersions(releaseId);
+export async function getReleaseView(releaseId) {
+  const release = await requireRelease(releaseId);
+  const versions = await loadVersions(releaseId);
   const latest = versions[versions.length - 1];
   const checks = validatePackage(latest.package);
 
-  const analysisRow = db()
-    .prepare(
-      "SELECT * FROM analyses WHERE release_id = ? ORDER BY id DESC LIMIT 1",
-    )
-    .get(releaseId);
+  const analysisRow = await get(
+    "SELECT * FROM analyses WHERE release_id = ? ORDER BY id DESC LIMIT 1",
+    [releaseId],
+  );
 
   let analysis = null;
   let statements = [];
@@ -140,22 +129,24 @@ export function getReleaseView(releaseId) {
       guardrailNotes: JSON.parse(analysisRow.notes_json),
     };
     // The working set is the statements of the most recent analysis.
-    const rows = db()
-      .prepare("SELECT * FROM statements WHERE analysis_id = ? ORDER BY id")
-      .all(analysisRow.id);
+    const rows = await all(
+      "SELECT * FROM statements WHERE analysis_id = ? ORDER BY id",
+      [analysisRow.id],
+    );
     statements = rows.map((row) => toStatementView(row, latest.package));
   }
 
-  const briefs = db()
-    .prepare("SELECT * FROM briefs WHERE release_id = ? ORDER BY id DESC")
-    .all(releaseId)
-    .map((b) => ({
-      id: b.id,
-      versionNumber: b.version_number,
-      reviewer: b.reviewer,
-      markdown: b.markdown,
-      createdAt: b.created_at,
-    }));
+  const briefRows = await all(
+    "SELECT * FROM briefs WHERE release_id = ? ORDER BY id DESC",
+    [releaseId],
+  );
+  const briefs = briefRows.map((b) => ({
+    id: b.id,
+    versionNumber: b.version_number,
+    reviewer: b.reviewer,
+    markdown: b.markdown,
+    createdAt: b.created_at,
+  }));
 
   return {
     id: release.id,
@@ -173,9 +164,9 @@ export function getReleaseView(releaseId) {
   };
 }
 
-export function getDiff(releaseId, from, to) {
-  requireRelease(releaseId);
-  const versions = loadVersions(releaseId);
+export async function getDiff(releaseId, from, to) {
+  await requireRelease(releaseId);
+  const versions = await loadVersions(releaseId);
   const before = versions.find((v) => v.number === from);
   const after = versions.find((v) => v.number === to);
   if (!before || !after) throw new HttpError(404, "Version not found.");
@@ -183,8 +174,8 @@ export function getDiff(releaseId, from, to) {
 }
 
 export async function runAnalysis(releaseId) {
-  requireRelease(releaseId);
-  const versions = loadVersions(releaseId);
+  await requireRelease(releaseId);
+  const versions = await loadVersions(releaseId);
   const latest = versions[versions.length - 1];
   if (hasFailures(validatePackage(latest.package))) {
     throw new HttpError(
@@ -197,15 +188,11 @@ export async function runAnalysis(releaseId) {
   const { result, notes } = applyGuardrails(raw, latest.package);
   const { statements, ...findings } = result;
 
-  const database = db();
-  database.exec("BEGIN");
-  try {
-    const { lastInsertRowid } = database
-      .prepare(
-        `INSERT INTO analyses (release_id, version_number, mode, model, result_json, notes_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+  await inTransaction(async (tx) => {
+    const { lastInsertRowid } = await tx.execute({
+      sql: `INSERT INTO analyses (release_id, version_number, mode, model, result_json, notes_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      args: [
         releaseId,
         latest.number,
         mode,
@@ -213,40 +200,36 @@ export async function runAnalysis(releaseId) {
         JSON.stringify(findings),
         JSON.stringify(notes),
         now(),
-      );
-    const insert = database.prepare(
-      `INSERT INTO statements
-         (analysis_id, release_id, version_number, kind, text, original_text, citations_json, source_hashes_json, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
+      ],
+    });
+    if (statements.length === 0) return;
     // Every statement starts as 'pending'. Only updateStatement, called from a
     // person's click, can change that.
-    for (const s of statements) {
-      insert.run(
-        Number(lastInsertRowid),
-        releaseId,
-        latest.number,
-        s.kind,
-        s.text,
-        s.text,
-        JSON.stringify(s.citations),
-        JSON.stringify(snapshotHashes(latest.package, s.citations)),
-        now(),
-      );
-    }
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+    await tx.batch(
+      statements.map((s) => ({
+        sql: `INSERT INTO statements
+                (analysis_id, release_id, version_number, kind, text, original_text, citations_json, source_hashes_json, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          Number(lastInsertRowid),
+          releaseId,
+          latest.number,
+          s.kind,
+          s.text,
+          s.text,
+          JSON.stringify(s.citations),
+          JSON.stringify(snapshotHashes(latest.package, s.citations)),
+          now(),
+        ],
+      })),
+    );
+  });
 }
 
-export function updateStatement(statementId, body) {
-  const row = db()
-    .prepare("SELECT * FROM statements WHERE id = ?")
-    .get(statementId);
+export async function updateStatement(statementId, body) {
+  const row = await get("SELECT * FROM statements WHERE id = ?", [statementId]);
   if (!row) throw new HttpError(404, "Statement not found.");
-  const versions = loadVersions(row.release_id);
+  const versions = await loadVersions(row.release_id);
   const latest = versions[versions.length - 1];
   const statement = toStatementView(row, latest.package);
 
@@ -270,19 +253,18 @@ export function updateStatement(statementId, body) {
       throw new HttpError(400, "Cite at least one release item.");
     // The reviewer has rewritten the statement against the current package, so
     // its sources are re-pinned to this version and it needs a fresh decision.
-    db()
-      .prepare(
-        `UPDATE statements SET text = ?, citations_json = ?, source_hashes_json = ?, version_number = ?,
+    await run(
+      `UPDATE statements SET text = ?, citations_json = ?, source_hashes_json = ?, version_number = ?,
            edited = 1, status = 'pending', updated_at = ? WHERE id = ?`,
-      )
-      .run(
+      [
         text,
         JSON.stringify(citations),
         JSON.stringify(snapshotHashes(latest.package, citations)),
         latest.number,
         now(),
         statementId,
-      );
+      ],
+    );
     return;
   }
 
@@ -306,13 +288,15 @@ export function updateStatement(statementId, body) {
       : body.action === "reject"
         ? "rejected"
         : "pending";
-  db()
-    .prepare("UPDATE statements SET status = ?, updated_at = ? WHERE id = ?")
-    .run(status, now(), statementId);
+  await run("UPDATE statements SET status = ?, updated_at = ? WHERE id = ?", [
+    status,
+    now(),
+    statementId,
+  ]);
 }
 
-export function createBrief(releaseId, reviewer) {
-  const view = getReleaseView(releaseId);
+export async function createBrief(releaseId, reviewer) {
+  const view = await getReleaseView(releaseId);
   if (view.briefBlockers.length > 0) {
     throw new HttpError(
       400,
@@ -327,9 +311,8 @@ export function createBrief(releaseId, reviewer) {
     reviewer,
     date: now().slice(0, 10),
   });
-  db()
-    .prepare(
-      "INSERT INTO briefs (release_id, version_number, reviewer, markdown, created_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .run(releaseId, view.latest.number, reviewer, markdown, now());
+  await run(
+    "INSERT INTO briefs (release_id, version_number, reviewer, markdown, created_at) VALUES (?, ?, ?, ?, ?)",
+    [releaseId, view.latest.number, reviewer, markdown, now()],
+  );
 }

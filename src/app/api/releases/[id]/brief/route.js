@@ -8,6 +8,6 @@ export function POST(request, ctx) {
   return respond(async () => {
     const id = parseId((await ctx.params).id);
     const { reviewer } = Body.parse(await request.json());
-    createBrief(id, reviewer);
+    await createBrief(id, reviewer);
   });
 }

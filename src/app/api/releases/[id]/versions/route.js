@@ -5,6 +5,6 @@ export function POST(request, ctx) {
   return respond(async () => {
     const id = parseId((await ctx.params).id);
     const input = PackageInputSchema.parse(await request.json());
-    return { number: saveVersion(id, input) };
+    return { number: await saveVersion(id, input) };
   });
 }

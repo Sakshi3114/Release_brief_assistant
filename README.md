@@ -4,7 +4,7 @@ A developer enters a structured release package. AI drafts cited summaries for t
 
 ## Run it
 
-Requires Node 22.13 or later (it uses Node's built-in SQLite module).
+Requires Node 20 or later. Locally the data is kept in a SQLite file (`data/app.db`), so there is no database to set up.
 
 ```bash
 npm install
@@ -17,6 +17,18 @@ The app works without an API key: it runs in **mock mode**, where keyword rules 
 npm test           # unit tests for the deterministic logic
 npm run lint
 ```
+
+## Deploying
+
+Serverless hosts such as Vercel have no disk that survives a restart, so a deployed copy needs a hosted database. The app uses [Turso](https://turso.tech), which is SQLite-compatible, so the same SQL runs locally and in production. Set these environment variables on the host:
+
+| Variable | Purpose |
+|---|---|
+| `TURSO_DATABASE_URL` | The database URL, starting with `libsql://` |
+| `TURSO_AUTH_TOKEN` | A token for that database |
+| `GEMINI_API_KEY` or `ANTHROPIC_API_KEY` | Optional; without one the app runs in mock mode |
+
+The tables are created automatically on first use.
 
 ## Try it in five minutes
 
@@ -31,7 +43,7 @@ npm run lint
 
 ## How it is built
 
-Next.js (App Router) in JavaScript, SQLite, and structured JSON output from the model (Claude or Gemini). Zod checks the shape of every request and of the model's reply at run time.
+Next.js (App Router) in JavaScript, SQLite (a local file in development, Turso when deployed), and structured JSON output from the model (Claude or Gemini). Zod checks the shape of every request and of the model's reply at run time.
 
 | Path | What it does |
 |---|---|
